@@ -8,7 +8,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gopkg.in/redis.v5/debug"
 	"gopkg.in/redis.v5/internal"
+)
+
+const (
+	metricConn        = "spiderman.redis.conn"
+	metricGetConn     = "spiderman.redis.conn.get"
+	metricReleaseConn = "spiderman.redis.conn.release"
 )
 
 var (
@@ -48,6 +55,9 @@ type Pooler interface {
 type dialer func() (net.Conn, error)
 
 type ConnPool struct {
+	addr string
+	tag  string
+
 	dial    dialer
 	OnClose func(*Conn) error
 
@@ -84,6 +94,14 @@ func NewConnPool(dial dialer, poolSize int, poolTimeout, idleTimeout, idleCheckF
 	if idleTimeout > 0 && idleCheckFrequency > 0 {
 		go p.reaper(idleCheckFrequency)
 	}
+
+	go p.report(time.Second * 10)
+	return p
+}
+
+func (p *ConnPool) WithAddr(addr string) *ConnPool {
+	p.addr = addr
+	p.tag = fmt.Sprintf("addr:%s", addr)
 	return p
 }
 
@@ -135,6 +153,7 @@ func (p *ConnPool) popFree() *Conn {
 // Get returns existed connection from the pool or creates a new one.
 func (p *ConnPool) Get() (*Conn, bool, error) {
 	if p.closed() {
+		debug.Incr(metricGetConn, p.tag, "type:closed")
 		return nil, false, ErrClosed
 	}
 
@@ -152,6 +171,7 @@ func (p *ConnPool) Get() (*Conn, bool, error) {
 	case <-timer.C:
 		timers.Put(timer)
 		atomic.AddUint32(&p.stats.Timeouts, 1)
+		debug.Incr(metricGetConn, p.tag, "type:timeout")
 		return nil, false, ErrPoolTimeout
 	}
 
@@ -170,12 +190,14 @@ func (p *ConnPool) Get() (*Conn, bool, error) {
 		}
 
 		atomic.AddUint32(&p.stats.Hits, 1)
+		debug.Incr(metricGetConn, p.tag, "type:pooled")
 		return cn, false, nil
 	}
 
 	newcn, err := p.NewConn()
 	if err != nil {
 		<-p.queue
+		debug.Incr(metricGetConn, p.tag, "type:bad")
 		return nil, false, err
 	}
 
@@ -183,6 +205,7 @@ func (p *ConnPool) Get() (*Conn, bool, error) {
 	p.conns = append(p.conns, newcn)
 	p.connsMu.Unlock()
 
+	debug.Incr(metricGetConn, p.tag, "type:new")
 	return newcn, true, nil
 }
 
@@ -192,6 +215,8 @@ func (p *ConnPool) Put(cn *Conn) error {
 		internal.Logf(err.Error())
 		return p.Remove(cn, err)
 	}
+
+	debug.Incr(metricReleaseConn, p.tag, "type:put")
 	p.freeConnsMu.Lock()
 	p.freeConns = append(p.freeConns, cn)
 	p.freeConnsMu.Unlock()
@@ -200,6 +225,8 @@ func (p *ConnPool) Put(cn *Conn) error {
 }
 
 func (p *ConnPool) Remove(cn *Conn, reason error) error {
+	debug.Incr(metricReleaseConn, p.tag, "type:remove", fmt.Sprintf("reason:%s", reason))
+
 	p.remove(cn, reason)
 	<-p.queue
 	return nil
@@ -334,6 +361,19 @@ func (p *ConnPool) reaper(frequency time.Duration) {
 			"reaper: removed %d stale conns (TotalConns=%d FreeConns=%d Requests=%d Hits=%d Timeouts=%d)",
 			n, s.TotalConns, s.FreeConns, s.Requests, s.Hits, s.Timeouts,
 		)
+	}
+}
+
+func (p *ConnPool) report(frequency time.Duration) {
+	ticker := time.NewTicker(frequency)
+	defer ticker.Stop()
+
+	for _ = range ticker.C {
+		if p.closed() {
+			break
+		}
+		debug.Gauge(metricConn, float64(p.FreeLen()), p.tag, "type:free")
+		debug.Gauge(metricConn, float64(p.Len()), p.tag, "type:pooled")
 	}
 }
 

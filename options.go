@@ -171,7 +171,7 @@ func newConnPool(opt *Options) *pool.ConnPool {
 		opt.PoolTimeout,
 		opt.IdleTimeout,
 		opt.IdleCheckFrequency,
-	)
+	).WithAddr(opt.Addr)
 }
 
 // PoolStats contains pool state information and accumulated stats.

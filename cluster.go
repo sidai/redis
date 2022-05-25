@@ -1,16 +1,25 @@
 package redis
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
+	"gopkg.in/redis.v5/debug"
 
 	"gopkg.in/redis.v5/internal"
 	"gopkg.in/redis.v5/internal/hashtag"
 	"gopkg.in/redis.v5/internal/pool"
 	"gopkg.in/redis.v5/internal/proto"
+)
+
+const (
+	metricRedisClusterProcess = "spiderman.redis.cluster.process"
 )
 
 var errClusterNoNodes = internal.RedisError("redis: cluster has no nodes")
@@ -198,6 +207,9 @@ func (c *clusterNodes) Get(addr string) (*clusterNode, error) {
 	c.addrs = append(c.addrs, addr)
 	node = newClusterNode(c.opt, addr)
 	c.nodes[addr] = node
+
+	ctx := debug.NewDebugCtx(context.Background(), "Add Node")
+	debug.Debugf(ctx, "New Node: %s - Latency: %dms", node.IP(), node.Latency.Milliseconds())
 	return node, nil
 }
 
@@ -432,12 +444,20 @@ func (c *ClusterClient) Close() error {
 func (c *ClusterClient) Process(cmd Cmder) error {
 	slot, node, err := c.cmdSlotAndNode(c.state(), cmd)
 	if err != nil {
+		cmd.accErr(err)
+		cmd.incrAttempts()
 		cmd.setErr(err)
 		return err
 	}
 
+	ctx := debug.NewDebugCtx(context.Background(), strings.ToUpper(fmt.Sprintf("%s %s", cmd.name(), cmd.arg(1))))
+	cmdTag := fmt.Sprintf("cmd:%s", cmd.name())
+	slotTag := fmt.Sprintf("slot:%d", slot)
+	ipTag := fmt.Sprintf("addr:%s", node.IP())
+
 	var ask bool
 	for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
+		cmd.incrAttempts()
 		if ask {
 			pipe := node.Client.Pipeline()
 			pipe.Process(NewCmd("ASKING"))
@@ -451,8 +471,14 @@ func (c *ClusterClient) Process(cmd Cmder) error {
 
 		// If there is no (real) error - we are done.
 		if err == nil {
+			debug.IncrCtx(ctx, metricRedisClusterProcess, cmdTag, ipTag, slotTag,
+				fmt.Sprintf("attempt:%d", attempt), "type:success")
 			return nil
 		}
+
+		cmd.accErr(err)
+		debug.IncrCtx(ctx, metricRedisClusterProcess, cmdTag, ipTag, slotTag,
+			fmt.Sprintf("attempt:%d", attempt), "type:failed", fmt.Sprintf("error:%s", internal.ParseError(err)))
 
 		// If slave is loading - read from master.
 		if c.opt.ReadOnly && internal.IsLoadingError(err) {
@@ -478,6 +504,7 @@ func (c *ClusterClient) Process(cmd Cmder) error {
 			if state != nil && slot >= 0 {
 				master, _ := state.slotMasterNode(slot)
 				if moved && (master == nil || master.Client.getAddr() != addr) {
+					debug.Debugf(ctx, "Attempt: %d, Slot: %d, MOVED %s -> %s trigger lazyReloadSlots", attempt, slot, node.IP(), hostString(addr))
 					c.lazyReloadSlots()
 				}
 			}
@@ -618,8 +645,10 @@ func (c *ClusterClient) lazyReloadSlots() {
 }
 
 func (c *ClusterClient) reloadSlots() (*clusterState, error) {
+	ctx := debug.NewDebugCtx(context.Background(), "Reload Slots")
 	node, err := c.nodes.Random()
 	if err != nil {
+		debug.Debugf(ctx, "Get Random Node Error: %+v", spew.Sdump(err))
 		return nil, err
 	}
 
@@ -627,6 +656,7 @@ func (c *ClusterClient) reloadSlots() (*clusterState, error) {
 	if c.cmds == nil {
 		cmds, err := node.Client.Command().Result()
 		if err != nil {
+			debug.Debugf(ctx, "Addr: %s, Run Command Error: %+v", node.IP(), spew.Sdump(err))
 			return nil, err
 		}
 		c.cmds = cmds
@@ -634,8 +664,11 @@ func (c *ClusterClient) reloadSlots() (*clusterState, error) {
 
 	slots, err := node.Client.ClusterSlots().Result()
 	if err != nil {
+		debug.Debugf(ctx, "Addr: %s, Get ClusterSlots Error: %+v", node.IP(), spew.Sdump(err))
 		return nil, err
 	}
+
+	debug.Debugf(ctx, "Addr: %s, Loaded ClusterSlots:\n%s", node.IP(), debug.Padding(ClusterSlots(slots).String(), 8))
 
 	return newClusterState(c.nodes, slots)
 }
