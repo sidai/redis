@@ -27,6 +27,10 @@ type Cmder interface {
 
 	SetErr(error)
 	Err() error
+
+	accErr(error)
+	incrAttempts()
+	Stat() (errs []error, attempts int)
 }
 
 func setCmdsErr(cmds []Cmder, e error) {
@@ -116,6 +120,21 @@ type baseCmd struct {
 	keyPos int8
 
 	_readTimeout *time.Duration
+
+	errorList []error
+	attempts  int
+}
+
+func (cmd *baseCmd) accErr(err error) {
+	cmd.errorList = append(cmd.errorList, err)
+}
+
+func (cmd *baseCmd) incrAttempts() {
+	cmd.attempts++
+}
+
+func (cmd *baseCmd) Stat() (errs []error, attempts int) {
+	return cmd.errorList, cmd.attempts
 }
 
 var _ Cmder = (*Cmd)(nil)

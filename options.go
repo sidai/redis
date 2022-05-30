@@ -425,5 +425,5 @@ func newConnPool(opt *Options) *pool.ConnPool {
 		PoolTimeout:        opt.PoolTimeout,
 		IdleTimeout:        opt.IdleTimeout,
 		IdleCheckFrequency: opt.IdleCheckFrequency,
-	})
+	}).WithAddr(opt.Addr)
 }

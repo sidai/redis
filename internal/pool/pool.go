@@ -3,12 +3,20 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/go-redis/redis/v8/debug"
 	"github.com/go-redis/redis/v8/internal"
+)
+
+const (
+	metricConn        = "spiderman.redis.conn"
+	metricGetConn     = "spiderman.redis.conn.get"
+	metricReleaseConn = "spiderman.redis.conn.release"
 )
 
 var (
@@ -89,6 +97,9 @@ type ConnPool struct {
 
 	_closed  uint32 // atomic
 	closedCh chan struct{}
+
+	addr string
+	tag  string
 }
 
 var _ Pooler = (*ConnPool)(nil)
@@ -111,6 +122,13 @@ func NewConnPool(opt *Options) *ConnPool {
 		go p.reaper(opt.IdleCheckFrequency)
 	}
 
+	go p.report(time.Second * 10)
+	return p
+}
+
+func (p *ConnPool) WithAddr(addr string) *ConnPool {
+	p.addr = addr
+	p.tag = fmt.Sprintf("addr:%s", addr)
 	return p
 }
 
@@ -268,6 +286,7 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 			continue
 		}
 
+		debug.Incr(metricGetConn, p.tag, "type:pooled")
 		atomic.AddUint32(&p.stats.Hits, 1)
 		return cn, nil
 	}
@@ -277,9 +296,11 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 	newcn, err := p.newConn(ctx, true)
 	if err != nil {
 		p.freeTurn()
+		debug.Incr(metricGetConn, p.tag, "type:closed")
 		return nil, err
 	}
 
+	debug.Incr(metricGetConn, p.tag, "type:new")
 	return newcn, nil
 }
 
@@ -290,6 +311,7 @@ func (p *ConnPool) getTurn() {
 func (p *ConnPool) waitTurn(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
+		debug.Incr(metricGetConn, p.tag, "type:ctxTimeout")
 		return ctx.Err()
 	default:
 	}
@@ -309,6 +331,7 @@ func (p *ConnPool) waitTurn(ctx context.Context) error {
 			<-timer.C
 		}
 		timers.Put(timer)
+		debug.Incr(metricGetConn, p.tag, "type:ctxTimeout")
 		return ctx.Err()
 	case p.queue <- struct{}{}:
 		if !timer.Stop() {
@@ -319,6 +342,7 @@ func (p *ConnPool) waitTurn(ctx context.Context) error {
 	case <-timer.C:
 		timers.Put(timer)
 		atomic.AddUint32(&p.stats.Timeouts, 1)
+		debug.Incr(metricGetConn, p.tag, "type:poolTimeout")
 		return ErrPoolTimeout
 	}
 }
@@ -371,12 +395,14 @@ func (p *ConnPool) Put(ctx context.Context, cn *Conn) {
 }
 
 func (p *ConnPool) Remove(ctx context.Context, cn *Conn, reason error) {
+	debug.Incr(metricReleaseConn, p.tag, "type:remove", fmt.Sprintf("reason:%s", reason))
 	p.removeConnWithLock(cn)
 	p.freeTurn()
 	_ = p.closeConn(cn)
 }
 
 func (p *ConnPool) CloseConn(cn *Conn) error {
+	debug.Incr(metricReleaseConn, p.tag, "type:remove", fmt.Sprintf("reason:staleConn"))
 	p.removeConnWithLock(cn)
 	return p.closeConn(cn)
 }
@@ -554,4 +580,17 @@ func (p *ConnPool) isStaleConn(cn *Conn) bool {
 	}
 
 	return false
+}
+
+func (p *ConnPool) report(frequency time.Duration) {
+	ticker := time.NewTicker(frequency)
+	defer ticker.Stop()
+
+	for _ = range ticker.C {
+		if p.closed() {
+			break
+		}
+		debug.Gauge(metricConn, float64(p.IdleLen()), p.tag, "type:free")
+		debug.Gauge(metricConn, float64(p.Len()), p.tag, "type:pooled")
+	}
 }
